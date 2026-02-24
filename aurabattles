@@ -1,1 +1,489 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local CoreGui = game:GetService("CoreGui")
 
+local player = Players.LocalPlayer
+local connections = {} 
+
+-- --- CONFIGURATION ---
+local SETTINGS = {
+    Active = false,             -- Whether the script is currently running
+    MaxDistance = 500,          -- Maximum radius to search for targets
+    Prediction = 0.13,          -- Adjusts for ping to keep you perfectly on the target
+    WaterMargin = 8,            -- Distance above water to consider "safe"
+    SafeZoneEnabled = true,     -- Whether to avoid and push away from safezones
+    PowerRatioLimit = 1.5,      -- Won't target players with more than 1.5x your power
+    HardFloorHeight = -100,     -- Minimum height before the script forces a recovery
+    LockDistance = 3.5,         -- How many studs to stay away from the target (prevents being inside them)
+    MaxTargetSpeed = 100,        -- Stops targeting anyone moving faster than 100 studs/s
+    MaxMoveSpeed = 60,          -- Caps your own movement speed to 60 studs/s for a natural look
+    SafeZoneMargin = 2.5,       -- How many studs to stay away from the SafeZone edge
+    IgnoreList = {},            -- List of usernames that the bot will never target
+    SwitchCooldown = 2,         -- How many seconds to wait after a target dies or enters a safezone
+    MaxTeleportDist = 500,      -- Maximum distance the bot will "snap" to a new target
+}
+
+local currentTarget = nil
+local lastSafeCFrame = nil
+local groundTimer = 0
+local waterLevel = -50
+local safeZonePart = nil
+local mapCenter = Vector3.zero 
+local FROZEN_Y_LEVEL = nil
+local cooldownEndTime = 0
+local lastValidTarget = nil
+local detectedUsers = {}
+local SecretAnimID = "rbxassetid://507770239"
+
+local waterPart = Workspace:FindFirstChild("Water")
+if waterPart then
+    waterLevel = waterPart.Position.Y + (waterPart.Size.Y / 2)
+else
+    for _, v in pairs(Workspace:GetChildren()) do
+        if v:IsA("BasePart") and (v.Name == "Water" or v.Name == "Ocean") then
+            waterLevel = v.Position.Y + (v.Size.Y / 2)
+            break
+        end
+    end
+end
+SETTINGS.HardFloorHeight = waterLevel + 15 
+
+local function findSafeZone()
+    local paths = {
+        Workspace:FindFirstChild("SafeZone"),
+        Workspace:FindFirstChild("Safe Zone"),
+        Workspace:FindFirstChild("Map") and Workspace.Map:FindFirstChild("Zones") and Workspace.Map.Zones:FindFirstChild("SafeZone"),
+        Workspace:FindFirstChild("Lobby") and Workspace.Lobby:FindFirstChild("SafeZone")
+    }
+    for _, part in paths do
+        if part and part:IsA("BasePart") then return part end
+    end
+    for _, desc in Workspace:GetDescendants() do
+        if desc:IsA("BasePart") and desc.Name == "SafeZone" then
+            return desc
+        end
+    end
+    return nil
+end
+
+safeZonePart = findSafeZone()
+if safeZonePart then mapCenter = safeZonePart.Position end
+
+local function getPower(plr)
+    if plr and plr:FindFirstChild("leaderstats") and plr.leaderstats:FindFirstChild("Power") then
+        return tonumber(plr.leaderstats.Power.Value) or 0
+    end
+    return 0
+end
+
+local function isIgnored(username)
+    if string.lower(username) == string.lower(player.Name) then return true end
+    for _, name in SETTINGS.IgnoreList do
+        if string.lower(username) == string.lower(name) then return true end
+    end
+    for _, name in detectedUsers do
+        if string.lower(username) == string.lower(name) then return true end
+    end
+    return false
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "VelocityLockUI"
+ScreenGui.Parent = CoreGui 
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 220, 0, 420)
+MainFrame.Position = UDim2.new(0.1, 0, 0.1, 0)
+MainFrame.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true 
+MainFrame.Parent = ScreenGui
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, 0, 0, 30)
+Title.BackgroundColor3 = Color3.fromRGB(50, 150, 255)
+Title.Text = "Velocity Lock (made by c___s)"
+Title.TextColor3 = Color3.new(1, 1, 1)
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 14
+Title.Parent = MainFrame
+
+local ToggleBtn = Instance.new("TextButton")
+ToggleBtn.Size = UDim2.new(0.9, 0, 0, 35)
+ToggleBtn.Position = UDim2.new(0.05, 0, 0.08, 0)
+ToggleBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+ToggleBtn.Text = "Status: OFF"
+ToggleBtn.TextColor3 = Color3.new(1, 1, 1)
+ToggleBtn.Font = Enum.Font.GothamBold
+ToggleBtn.TextSize = 14
+ToggleBtn.Parent = MainFrame
+
+ToggleBtn.MouseButton1Click:Connect(function()
+    SETTINGS.Active = not SETTINGS.Active
+    if SETTINGS.Active then
+        ToggleBtn.Text = "Status: ON"
+        ToggleBtn.BackgroundColor3 = Color3.fromRGB(50, 200, 50)
+        local char = player.Character
+        if char and char:FindFirstChild("HumanoidRootPart") then
+            FROZEN_Y_LEVEL = char.HumanoidRootPart.Position.Y
+        end
+        safeZonePart = findSafeZone()
+        if safeZonePart then mapCenter = safeZonePart.Position end
+    else
+        ToggleBtn.Text = "Status: OFF"
+        ToggleBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+        currentTarget = nil
+        lastValidTarget = nil
+        cooldownEndTime = 0
+        FROZEN_Y_LEVEL = nil
+    end
+end)
+
+local IgnoreBox = Instance.new("TextBox")
+IgnoreBox.Size = UDim2.new(0.9, 0, 0, 40)
+IgnoreBox.Position = UDim2.new(0.05, 0, 0.18, 0)
+IgnoreBox.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+IgnoreBox.PlaceholderText = "Ignore Users (comma separated)"
+IgnoreBox.Text = ""
+IgnoreBox.TextColor3 = Color3.new(1, 1, 1)
+IgnoreBox.Font = Enum.Font.Gotham
+IgnoreBox.TextSize = 11
+IgnoreBox.TextWrapped = true
+IgnoreBox.ClearTextOnFocus = false
+IgnoreBox.Parent = MainFrame
+
+IgnoreBox:GetPropertyChangedSignal("Text"):Connect(function()
+    local list = {}
+    for name in string.gmatch(IgnoreBox.Text, "[^,]+") do
+        local cleaned = string.gsub(name, "^%s*(.-)%s*$", "%1")
+        if cleaned ~= "" then table.insert(list, cleaned) end
+    end
+    SETTINGS.IgnoreList = list
+end)
+
+local PowerLabel = Instance.new("TextLabel")
+PowerLabel.Size = UDim2.new(0.9, 0, 0, 40)
+PowerLabel.Position = UDim2.new(0.05, 0, 0.29, 0)
+PowerLabel.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+PowerLabel.Text = "Waiting for Target..."
+PowerLabel.TextColor3 = Color3.new(1, 0.8, 0.2)
+PowerLabel.Font = Enum.Font.GothamBold
+PowerLabel.TextSize = 11
+PowerLabel.TextWrapped = true
+PowerLabel.Parent = MainFrame
+
+local UserListLabel = Instance.new("TextLabel")
+UserListLabel.Size = UDim2.new(0.9, 0, 0, 20)
+UserListLabel.Position = UDim2.new(0.05, 0, 0.40, 0)
+UserListLabel.BackgroundTransparency = 1
+UserListLabel.Text = "Detected Script Users:"
+UserListLabel.TextColor3 = Color3.new(0.2, 0.8, 1)
+UserListLabel.Font = Enum.Font.GothamBold
+UserListLabel.TextSize = 11
+UserListLabel.Parent = MainFrame
+
+local UserListBox = Instance.new("TextLabel")
+UserListBox.Size = UDim2.new(0.9, 0, 0, 80)
+UserListBox.Position = UDim2.new(0.05, 0, 0.46, 0)
+UserListBox.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+UserListBox.Text = "None Detected"
+UserListBox.TextColor3 = Color3.new(0.7, 0.7, 0.7)
+UserListBox.Font = Enum.Font.Gotham
+UserListBox.TextSize = 10
+UserListBox.TextWrapped = true
+UserListBox.TextYAlignment = Enum.TextYAlignment.Top
+UserListBox.Parent = MainFrame
+
+local RangeLabel = Instance.new("TextLabel")
+RangeLabel.Size = UDim2.new(1, 0, 0, 20)
+RangeLabel.Position = UDim2.new(0.05, 0, 0.68, 0)
+RangeLabel.BackgroundTransparency = 1
+RangeLabel.Text = "Range: 150 studs"
+RangeLabel.TextColor3 = Color3.new(0.8, 0.8, 0.8)
+RangeLabel.Font = Enum.Font.Gotham
+RangeLabel.TextSize = 12
+RangeLabel.Parent = MainFrame
+
+local RangeSlider = Instance.new("TextButton")
+RangeSlider.Size = UDim2.new(0.9, 0, 0, 6)
+RangeSlider.Position = UDim2.new(0.05, 0, 0.76, 0)
+RangeSlider.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+RangeSlider.Text = ""
+RangeSlider.AutoButtonColor = false
+RangeSlider.Parent = MainFrame
+
+local RangeFill = Instance.new("Frame")
+RangeFill.Size = UDim2.new(0.3, 0, 1, 0)
+RangeFill.BackgroundColor3 = Color3.fromRGB(50, 150, 255)
+RangeFill.BorderSizePixel = 0
+RangeFill.Parent = RangeSlider
+
+local UnloadBtn = Instance.new("TextButton")
+UnloadBtn.Size = UDim2.new(0.9, 0, 0, 30)
+UnloadBtn.Position = UDim2.new(0.05, 0, 0.91, 0)
+UnloadBtn.BackgroundColor3 = Color3.fromRGB(150, 0, 0)
+UnloadBtn.Text = "UNLOAD SCRIPT"
+UnloadBtn.TextColor3 = Color3.new(1, 1, 1)
+UnloadBtn.Font = Enum.Font.GothamBold
+UnloadBtn.TextSize = 12
+UnloadBtn.Parent = MainFrame
+
+UnloadBtn.MouseButton1Click:Connect(function()
+    for _, conn in connections do if conn then conn:Disconnect() end end
+    ScreenGui:Destroy()
+end)
+
+local draggingRange = false
+table.insert(connections, RangeSlider.MouseButton1Down:Connect(function() draggingRange = true end))
+table.insert(connections, UserInputService.InputEnded:Connect(function(input) 
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then draggingRange = false end 
+end))
+
+table.insert(connections, RunService.RenderStepped:Connect(function()
+    if draggingRange then
+        local mouseX = UserInputService:GetMouseLocation().X
+        local pct = math.clamp((mouseX - RangeSlider.AbsolutePosition.X) / RangeSlider.AbsoluteSize.X, 0, 1)
+        SETTINGS.MaxDistance = math.floor(pct * 500)
+        RangeFill.Size = UDim2.new(pct, 0, 1, 0)
+        RangeLabel.Text = "Range: " .. SETTINGS.MaxDistance .. " studs"
+    end
+end))
+
+local function broadcastHandshake()
+    local char = player.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    local animator = hum:FindFirstChildOfClass("Animator") or hum:FindFirstChild("Animator")
+    if not animator then return end
+    
+    local isPlaying = false
+    for _, track in animator:GetPlayingAnimationTracks() do
+        if track.Animation.AnimationId == SecretAnimID then
+            isPlaying = true
+            break
+        end
+    end
+    
+    if not isPlaying then
+        local anim = Instance.new("Animation")
+        anim.AnimationId = SecretAnimID
+        local track = animator:LoadAnimation(anim)
+        track.Priority = Enum.AnimationPriority.Action
+        track.Looped = true
+        track:Play()
+    end
+end
+
+local function scanForUsers()
+    local found = {}
+    for _, p in Players:GetPlayers() do
+        if p ~= player and p.Character then
+            local hum = p.Character:FindFirstChildOfClass("Humanoid")
+            if hum then
+                local animator = hum:FindFirstChildOfClass("Animator")
+                if animator then
+                    for _, track in animator:GetPlayingAnimationTracks() do
+                        if track.Animation.AnimationId == SecretAnimID then
+                            table.insert(found, p.Name)
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    detectedUsers = found
+    if #found > 0 then
+        UserListBox.Text = table.concat(found, ", ")
+    else
+        UserListBox.Text = "None Detected"
+    end
+end
+
+task.spawn(function()
+    while true do
+        broadcastHandshake()
+        scanForUsers()
+        task.wait(2)
+    end
+end)
+
+local function checkSafeZone(pos)
+    if not safeZonePart or not safeZonePart.Parent then safeZonePart = findSafeZone() end
+    if not safeZonePart then return false end
+    local relPos = safeZonePart.CFrame:PointToObjectSpace(pos)
+    local size = safeZonePart.Size
+    return math.abs(relPos.X) <= size.X / 2 and math.abs(relPos.Y) <= size.Y / 2 and math.abs(relPos.Z) <= size.Z / 2
+end
+
+local function isPositionSafe(pos, velocity)
+    if pos.Y <= (waterLevel + SETTINGS.WaterMargin) then return false end
+    return velocity.Y >= -70
+end
+
+local function getClosestTarget()
+    local char = player.Character
+    if not char then return nil end
+    local myHrp = char:FindFirstChild("HumanoidRootPart")
+    if not myHrp then return nil end
+    local myPower = getPower(player)
+    
+    local closestDist = SETTINGS.MaxDistance
+    local closestChar = nil
+
+    for _, p in Players:GetPlayers() do
+        if p ~= player and p.Character then
+            local pHrp = p.Character:FindFirstChild("HumanoidRootPart")
+            local pHum = p.Character:FindFirstChild("Humanoid")
+
+            if pHrp and pHum and pHum.Health > 0 and not isIgnored(p.Name) then
+                if pHrp.AssemblyLinearVelocity.Magnitude <= SETTINGS.MaxTargetSpeed and not checkSafeZone(pHrp.Position) then
+                    if getPower(p) <= (myPower * SETTINGS.PowerRatioLimit) then
+                        local dist = (myHrp.Position - pHrp.Position).Magnitude
+                        if dist < closestDist and dist <= SETTINGS.MaxTeleportDist and isPositionSafe(pHrp.Position, pHrp.AssemblyLinearVelocity) then
+                            closestDist = dist
+                            closestChar = p.Character
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return closestChar
+end
+
+table.insert(connections, RunService.Stepped:Connect(function(_, dt)
+    local char = player.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChild("Humanoid")
+    if not hrp or not hum then return end
+
+    if not hum.Sit and not currentTarget then
+        local moveDir = hum.MoveDirection
+        local walkSpeed = hum.WalkSpeed
+        local currentVel = hrp.AssemblyLinearVelocity
+        hrp.AssemblyLinearVelocity = Vector3.new(moveDir.X * walkSpeed, currentVel.Y, moveDir.Z * walkSpeed)
+    end
+
+    local isGrounded = (hum.FloorMaterial ~= Enum.Material.Air)
+    local safePos = isPositionSafe(hrp.Position, hrp.AssemblyLinearVelocity)
+
+    if isGrounded and safePos then
+        groundTimer += dt
+        if groundTimer > 0.1 then lastSafeCFrame = hrp.CFrame end
+    else
+        groundTimer = 0
+    end
+
+    if not safePos and lastSafeCFrame then
+        hrp.CFrame = lastSafeCFrame + Vector3.new(0, 2, 0)
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        currentTarget = nil
+        lastValidTarget = nil
+        PowerLabel.Text = "Recovering..."
+    end
+
+    if SETTINGS.Active then
+        if FROZEN_Y_LEVEL then
+            hrp.AssemblyLinearVelocity = Vector3.new(hrp.AssemblyLinearVelocity.X, 0, hrp.AssemblyLinearVelocity.Z)
+            hrp.CFrame = CFrame.new(hrp.Position.X, FROZEN_Y_LEVEL, hrp.Position.Z) * hrp.CFrame.Rotation
+        end
+
+        if not currentTarget then
+            if tick() >= cooldownEndTime then
+                currentTarget = getClosestTarget()
+                if not currentTarget then
+                    PowerLabel.Text = "Searching..."
+                    PowerLabel.TextColor3 = Color3.new(1, 1, 1)
+                end
+            else
+                PowerLabel.Text = string.format("CD: %.1f", math.max(0, cooldownEndTime - tick()))
+                PowerLabel.TextColor3 = Color3.new(1, 0.5, 0)
+            end
+        end
+
+        if currentTarget then
+            local enemyHrp = currentTarget:FindFirstChild("HumanoidRootPart")
+            local enemyHum = currentTarget:FindFirstChild("Humanoid")
+            local enemyPlr = Players:GetPlayerFromCharacter(currentTarget)
+
+            local lostReason = nil
+            if not currentTarget:IsDescendantOf(game) or not currentTarget.Parent then lostReason = "Removed"
+            elseif not enemyHrp or not enemyHum or enemyHum.Health <= 0 then lostReason = "Died"
+            elseif checkSafeZone(enemyHrp.Position) then lostReason = "SafeZone"
+            elseif isIgnored(enemyPlr.Name) then lostReason = "Ignored"
+            elseif enemyHrp.AssemblyLinearVelocity.Magnitude > SETTINGS.MaxTargetSpeed then lostReason = "Speed"
+            elseif not isPositionSafe(enemyHrp.Position, enemyHrp.AssemblyLinearVelocity) then lostReason = "Unsafe"
+            end
+
+            if lostReason then
+                if lastValidTarget == currentTarget then
+                    cooldownEndTime = tick() + SETTINGS.SwitchCooldown
+                end
+                currentTarget = nil
+                lastValidTarget = nil
+                return
+            end
+
+            lastValidTarget = currentTarget
+
+            local myPower = getPower(player)
+            local enemyPower = getPower(enemyPlr)
+            PowerLabel.Text = string.format("LOCKED: %s\nPow: %d vs You: %d", enemyPlr.Name, enemyPower, myPower)
+
+            local enemyVel = enemyHrp.AssemblyLinearVelocity
+            local targetVel = Vector3.new(enemyVel.X, 0, enemyVel.Z)
+            if targetVel.Magnitude > SETTINGS.MaxMoveSpeed then
+                targetVel = targetVel.Unit * SETTINGS.MaxMoveSpeed
+            end
+            hrp.AssemblyLinearVelocity = targetVel
+            
+            local ping = player:GetNetworkPing()
+            local predictedOffset = enemyVel * (ping + SETTINGS.Prediction)
+            local targetPos = enemyHrp.Position + predictedOffset
+            
+            local flatTarget = Vector3.new(targetPos.X, 0, targetPos.Z)
+            local flatSafeZone = Vector3.new(mapCenter.X, 0, mapCenter.Z)
+            local pushDirection = (flatTarget - flatSafeZone).Unit
+            if mapCenter == Vector3.zero then pushDirection = -enemyHrp.CFrame.LookVector end
+
+            local desiredPos = targetPos - (pushDirection * SETTINGS.LockDistance)
+            
+            local currentPos = hrp.Position
+            local moveVec = (desiredPos - currentPos)
+            local distToMove = moveVec.Magnitude
+            local maxFrameDist = SETTINGS.MaxMoveSpeed * dt
+            
+            local finalPos = desiredPos
+            if distToMove > maxFrameDist then
+                finalPos = currentPos + (moveVec.Unit * maxFrameDist)
+            end
+            finalPos = Vector3.new(finalPos.X, FROZEN_Y_LEVEL or finalPos.Y, finalPos.Z)
+
+            if safeZonePart then
+                local playerRelPos = safeZonePart.CFrame:PointToObjectSpace(finalPos)
+                local size = safeZonePart.Size
+                local margin = SETTINGS.SafeZoneMargin
+                if math.abs(playerRelPos.X) < (size.X / 2 + margin) and math.abs(playerRelPos.Y) < (size.Y / 2 + margin) and math.abs(playerRelPos.Z) < (size.Z / 2 + margin) then
+                    local diffX = (size.X / 2 + margin) - math.abs(playerRelPos.X)
+                    local diffZ = (size.Z / 2 + margin) - math.abs(playerRelPos.Z)
+                    local newRelPos = playerRelPos
+                    if diffX < diffZ then
+                        newRelPos = Vector3.new(math.sign(playerRelPos.X) * (size.X / 2 + margin), playerRelPos.Y, playerRelPos.Z)
+                    else
+                        newRelPos = Vector3.new(playerRelPos.X, playerRelPos.Y, math.sign(playerRelPos.Z) * (size.Z / 2 + margin))
+                    end
+                    finalPos = safeZonePart.CFrame:PointToWorldSpace(newRelPos)
+                end
+            end
+
+            hrp.CFrame = CFrame.new(finalPos, Vector3.new(targetPos.X, finalPos.Y, targetPos.Z))
+        end
+    end
+end))
